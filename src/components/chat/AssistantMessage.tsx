@@ -47,7 +47,7 @@ export function AssistantMessage({
   const { mutate: restoreMessage } = useRestoreMessageMutation();
   const { mutate: retryMessage } = useRetryMessageMutation();
   const isLoading = useIsLoading();
-  const model = message.content.model ?? 'anthropic/claude-sonnet-4.5';
+  const model = message.content.model ?? 'anthropic/claude-opus-4-6';
 
   const changeLeaf = useCallback(
     (messageId: string) => {
@@ -252,7 +252,7 @@ function ObjectButton({
   currentVersion: number;
 }) {
   const [isHovered, setIsHovered] = useState(false);
-  let title = 'Adam Object';
+  let title = 'CAD Object';
   if (message.content.artifact) {
     title = message.content.artifact.title;
   }

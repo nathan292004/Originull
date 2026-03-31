@@ -52,7 +52,7 @@ const Loader = ({ message }: Props) => {
     return () => {
       clearInterval(titleInterval);
       clearInterval(interval);
-      document.title = 'Adam';
+      document.title = 'CAD Studio';
     };
   }, [changingMessage]);
 

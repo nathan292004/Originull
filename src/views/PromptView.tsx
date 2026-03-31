@@ -19,7 +19,7 @@ export function PromptView() {
   const { isSidebarOpen } = useOutletContext<{ isSidebarOpen: boolean }>();
   const queryClient = useQueryClient();
 
-  const [model, setModel] = useState<Model>('google/gemini-3-pro-preview');
+  const [model, setModel] = useState<Model>('anthropic/claude-opus-4-6');
   const [isLoaded, setIsLoaded] = useState(false);
   const [images, setImages] = useState<MessageItem[]>([]);
   const [meshUpload, setMeshUpload] = useState<MeshUploadState | null>(null);
@@ -161,7 +161,7 @@ export function PromptView() {
                     id: newConversationId,
                     user_id: user?.id ?? '',
                   }}
-                  placeholder="Start building with Adam..."
+                  placeholder="Start building..."
                   model={model}
                   setModel={setModel}
                   showPromptGenerator={true}

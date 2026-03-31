@@ -13,9 +13,35 @@ import parseParameters from '../_shared/parseParameter.ts';
 import { formatUserMessage } from '../_shared/messageUtils.ts';
 import { corsHeaders } from '../_shared/cors.ts';
 
-// OpenRouter API configuration
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY') ?? '';
+// API configuration: route by model id (anthropic/*, openai/*, or google/*)
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
+const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+function getAnthropicModel(model: string): string {
+  const m = model.replace(/^anthropic\//i, '').trim();
+  return m || 'claude-opus-4-6';
+}
+function getOpenAIModel(model: string): string {
+  const m = model.replace(/^openai\//i, '').trim();
+  return m || 'gpt-4o-mini';
+}
+function getGeminiModel(model: string): string {
+  const m = model.replace(/^google\//i, '').trim();
+  return m || 'gemini-2.0-flash';
+}
+function useAnthropic(model: string): boolean {
+  return model.toLowerCase().startsWith('anthropic/');
+}
+function useOpenAI(model: string): boolean {
+  return model.toLowerCase().startsWith('openai/');
+}
+function useGemini(model: string): boolean {
+  return model.toLowerCase().startsWith('google/');
+}
 
 // Helper to stream updated assistant message rows
 function streamMessage(
@@ -172,67 +198,113 @@ interface OpenRouterRequest {
 
 async function generateTitleFromMessages(
   messagesToSend: OpenAIMessage[],
+  preferProvider: 'anthropic' | 'openai' | 'gemini',
 ): Promise<string> {
-  try {
-    const titleSystemPrompt = `Generate a short title for a 3D object. Rules:
+  const titleSystemPrompt = `Generate a short title for a 3D object. Rules:
 - Maximum 25 characters
 - Just the object name, nothing else
 - No explanations, notes, or commentary
 - No quotes or special formatting
 - Examples: "Coffee Mug", "Gear Assembly", "Phone Stand"`;
 
-    const response = await fetch(OPENROUTER_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://adam-cad.com',
-        'X-Title': 'Adam CAD',
-      },
-      body: JSON.stringify({
-        model: 'anthropic/claude-3.5-haiku',
-        max_tokens: 30,
-        messages: [
-          { role: 'system', content: titleSystemPrompt },
-          ...messagesToSend,
+  try {
+    if (preferProvider === 'anthropic' && ANTHROPIC_API_KEY) {
+      const lastUserMsg = messagesToSend.filter((m) => m.role === 'user').pop();
+      const userText =
+        typeof lastUserMsg?.content === 'string'
+          ? lastUserMsg.content
+          : Array.isArray(lastUserMsg?.content)
+            ? (lastUserMsg.content as Array<{ type: string; text?: string }>)
+                .filter((b) => b.type === 'text')
+                .map((b) => b.text)
+                .join(' ')
+            : '';
+      const res = await fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-opus-4-6',
+          system: titleSystemPrompt,
+          max_tokens: 30,
+          messages: [{ role: 'user', content: userText || 'Generate a title' }],
+        }),
+      });
+      if (!res.ok) throw new Error(`Anthropic title: ${res.statusText}`);
+      const data = await res.json();
+      let title = data.content?.[0]?.text?.trim?.() ?? '';
+      title = title
+        .replace(/^["']|["']$/g, '')
+        .replace(/^title:\s*/i, '')
+        .trim();
+      if (title.length > 27) title = title.substring(0, 24) + '...';
+      if (title.length >= 2) return title;
+    }
+    if (preferProvider === 'openai' && OPENAI_API_KEY) {
+      const response = await fetch(OPENAI_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 30,
+          messages: [
+            { role: 'system', content: titleSystemPrompt },
+            ...messagesToSend,
+            { role: 'user', content: 'Title:' },
+          ],
+        }),
+      });
+      if (!response.ok) throw new Error(`OpenAI: ${response.statusText}`);
+      const data = await response.json();
+      let title = data.choices?.[0]?.message?.content?.trim?.() ?? '';
+      title = title
+        .replace(/^["']|["']$/g, '')
+        .replace(/^title:\s*/i, '')
+        .trim();
+      if (title.length > 27) title = title.substring(0, 24) + '...';
+      if (title.length >= 2) return title;
+    }
+    if (preferProvider === 'gemini' && GEMINI_API_KEY) {
+      const contents = messagesToSend.map((m) => ({
+        role: m.role === 'user' ? 'user' : 'model',
+        parts: [
           {
-            role: 'user',
-            content: 'Title:',
+            text:
+              typeof m.content === 'string'
+                ? m.content
+                : JSON.stringify(m.content),
           },
         ],
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`OpenRouter API error: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    if (data.choices && data.choices[0]?.message?.content) {
-      let title = data.choices[0].message.content.trim();
-
-      // Clean up common LLM artifacts
-      // Remove quotes
-      title = title.replace(/^["']|["']$/g, '');
-      // Remove "Title:" prefix if model echoed it
-      title = title.replace(/^title:\s*/i, '');
-      // Remove any trailing punctuation except necessary ones
-      title = title.replace(/[.!?:;,]+$/, '');
-      // Remove meta-commentary patterns
-      title = title.replace(
-        /\s*(note[s]?|here'?s?|based on|for the|this is).*$/i,
-        '',
+      }));
+      contents.push({ role: 'user', parts: [{ text: 'Title:' }] });
+      const res = await fetch(
+        `${GEMINI_API_BASE}/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents,
+            systemInstruction: { parts: [{ text: titleSystemPrompt }] },
+            generationConfig: { maxOutputTokens: 30 },
+          }),
+        },
       );
-      // Trim again after cleanup
-      title = title.trim();
-
-      // Enforce max length
+      if (!res.ok) throw new Error(`Gemini: ${res.statusText}`);
+      const data = await res.json();
+      const text =
+        data.candidates?.[0]?.content?.parts?.[0]?.text?.trim?.() ?? '';
+      let title = text
+        .replace(/^["']|["']$/g, '')
+        .replace(/^title:\s*/i, '')
+        .trim();
       if (title.length > 27) title = title.substring(0, 24) + '...';
-
-      // If title is empty or too short after cleanup, return null to use fallback
-      if (title.length < 2) return 'Adam Object';
-
-      return title;
+      if (title.length >= 2) return title;
     }
   } catch (error) {
     console.error('Error generating object title:', error);
@@ -254,11 +326,11 @@ async function generateTitleFromMessages(
       .trim();
   }
 
-  return 'Adam Object';
+  return 'CAD Object';
 }
 
 // Outer agent system prompt (conversational + tool-using)
-const PARAMETRIC_AGENT_PROMPT = `You are Adam, an AI CAD editor that creates and modifies OpenSCAD models.
+const PARAMETRIC_AGENT_PROMPT = `You are an AI CAD editor that creates and modifies OpenSCAD models.
 Speak back to the user briefly (one or two sentences), then use tools to make changes.
 Prefer using tools to update the model rather than returning full code directly.
 Do not rewrite or change the user's intent. Do not add unrelated constraints.
@@ -276,6 +348,133 @@ Guidelines:
 - When the user asks for simple parameter tweaks (like "height to 80"), call apply_parameter_changes.
 - Keep text concise and helpful. Ask at most 1 follow-up question when truly needed.
 - Pass the user's request directly to the tool without modification (e.g., if user says "a mug", pass "a mug" to build_parametric_model).`;
+
+// Convert OpenAI-format messages to Gemini contents (no system; use systemInstruction separately)
+function convertToGeminiContents(
+  _systemPrompt: string,
+  messages: OpenAIMessage[],
+): Array<{
+  role: string;
+  parts: Array<{
+    text?: string;
+    inlineData?: { mimeType: string; data: string };
+  }>;
+}> {
+  return messages.map((m) => {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    const parts: Array<{
+      text?: string;
+      inlineData?: { mimeType: string; data: string };
+    }> = [];
+    if (typeof m.content === 'string') {
+      parts.push({ text: m.content });
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (part && typeof part === 'object') {
+          if ('text' in part && typeof part.text === 'string')
+            parts.push({ text: part.text });
+          if ('image_url' in part && part.image_url?.url) {
+            const url = part.image_url.url;
+            if (url.startsWith('data:')) {
+              const match = url.match(/^data:([^;]+);base64,(.+)$/);
+              if (match)
+                parts.push({
+                  inlineData: {
+                    mimeType: match[1] || 'image/png',
+                    data: match[2],
+                  },
+                });
+            }
+          }
+        }
+      }
+    }
+    if (parts.length === 0) parts.push({ text: '' });
+    return { role, parts };
+  });
+}
+
+// Convert OpenAI-format messages to Anthropic format
+function convertToAnthropicMessages(
+  messages: OpenAIMessage[],
+): Array<{ role: 'user' | 'assistant'; content: unknown }> {
+  return messages.map((m) => {
+    if (m.role === 'user') {
+      const content = Array.isArray(m.content)
+        ? m.content.map((block) => {
+            if (block.type === 'text')
+              return { type: 'text', text: block.text };
+            if (block.type === 'image_url' && block.image_url?.url) {
+              const url = block.image_url.url;
+              if (url.startsWith('data:')) {
+                const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                if (match) {
+                  return {
+                    type: 'image',
+                    source: {
+                      type: 'base64',
+                      media_type: match[1],
+                      data: match[2],
+                    },
+                  };
+                }
+              }
+              return { type: 'image', source: { type: 'url', url } };
+            }
+            return block;
+          })
+        : [{ type: 'text', text: m.content as string }];
+      return { role: 'user' as const, content };
+    }
+    // assistant
+    const text = typeof m.content === 'string' ? m.content : '';
+    return { role: 'assistant' as const, content: [{ type: 'text', text }] };
+  });
+}
+
+// Tool definitions in Anthropic format
+const anthropicTools = [
+  {
+    name: 'build_parametric_model',
+    description:
+      'Generate or update an OpenSCAD model from user intent and context. Include parameters and ensure the model is manifold and 3D-printable.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'User request for the model' },
+        imageIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Image IDs to reference',
+        },
+        baseCode: { type: 'string', description: 'Existing code to modify' },
+        error: { type: 'string', description: 'Error to fix' },
+      },
+    },
+  },
+  {
+    name: 'apply_parameter_changes',
+    description:
+      'Apply simple parameter updates to the current artifact without re-generating the whole model.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        updates: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              value: { type: 'string' },
+            },
+            required: ['name', 'value'],
+          },
+        },
+      },
+      required: ['updates'],
+    },
+  },
+];
 
 // Tool definitions in OpenAI format
 const tools = [
@@ -328,7 +527,7 @@ const tools = [
 ];
 
 // Strict prompt for producing only OpenSCAD (no suggestion requirement)
-const STRICT_CODE_PROMPT = `You are Adam, an AI CAD editor that creates and modifies OpenSCAD models. You assist users by chatting with them and making changes to their CAD in real-time. You understand that users can see a live preview of the model in a viewport on the right side of the screen while you make changes.
+const STRICT_CODE_PROMPT = `You are an AI CAD editor that creates and modifies OpenSCAD models. You assist users by chatting with them and making changes to their CAD in real-time. You understand that users can see a live preview of the model in a viewport on the right side of the screen while you make changes.
  
 When a user sends a message, you will reply with a response that contains only the most expert code for OpenSCAD according to a given prompt. Make sure that the syntax of the code is correct and that all parts are connected as a 3D printable object. Always write code with changeable parameters. Never include parameters to adjust color. Initialize and declare the variables at the start of the code. Do not write any other text or comments in the response. If I ask about anything other than code for the OpenSCAD platform, only return a text containing '404'. Always ensure your responses are consistent with previous responses. Never include extra text in the response. Use any provided OpenSCAD documentation or context in the conversation to inform your responses.
 
@@ -401,25 +600,30 @@ Deno.serve(async (req) => {
     });
   }
 
+  const isLocal = Deno.env.get('ENVIRONMENT') === 'local';
   const supabaseClient = getAnonSupabaseClient({
     global: {
       headers: { Authorization: req.headers.get('Authorization') ?? '' },
     },
   });
 
-  const { data: userData, error: userError } =
-    await supabaseClient.auth.getUser();
-  if (!userData.user) {
-    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
-  }
-  if (userError) {
-    return new Response(JSON.stringify({ error: userError.message }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+  let userId = 'local-dev-user';
+  if (!isLocal) {
+    const { data: userData, error: userError } =
+      await supabaseClient.auth.getUser();
+    if (!userData.user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    if (userError) {
+      return new Response(JSON.stringify({ error: userError.message }), {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    userId = userData.user.id;
   }
 
   const {
@@ -427,13 +631,11 @@ Deno.serve(async (req) => {
     conversationId,
     model,
     newMessageId,
-    thinking, // Add thinking parameter
   }: {
     messageId: string;
     conversationId: string;
     model: Model;
     newMessageId: string;
-    thinking?: boolean;
   } = await req.json();
 
   const { data: messages, error: messagesError } = await supabaseClient
@@ -506,7 +708,7 @@ Deno.serve(async (req) => {
           const formatted = await formatUserMessage(
             msg,
             supabaseClient,
-            userData.user.id,
+            userId,
             conversationId,
           );
           // Convert Anthropic-style to OpenAI-style
@@ -556,44 +758,176 @@ Deno.serve(async (req) => {
       }),
     );
 
-    // Prepare request body
-    const requestBody: OpenRouterRequest = {
-      model,
-      messages: [
-        { role: 'system', content: PARAMETRIC_AGENT_PROMPT },
-        ...messagesToSend,
-      ],
-      tools,
-      stream: true,
-      max_tokens: 16000,
-    };
-
-    // Add reasoning/thinking parameter if requested and supported
-    // OpenRouter uses a unified 'reasoning' parameter
-    if (thinking) {
-      requestBody.reasoning = {
-        max_tokens: 12000,
-      };
-      // Ensure total max_tokens is high enough to accommodate reasoning + output
-      requestBody.max_tokens = 20000;
+    const isAnthropic = useAnthropic(model);
+    const isOpenAI = useOpenAI(model);
+    const isGemini = useGemini(model);
+    if (!isAnthropic && !isOpenAI && !isGemini) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'Unsupported model. Use anthropic/claude-opus-4-6, openai/gpt-4o-mini, or google/gemini-2.0-flash',
+        }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        },
+      );
+    }
+    if (isAnthropic && !ANTHROPIC_API_KEY) {
+      return new Response(
+        JSON.stringify({ error: 'Anthropic API key not configured' }),
+        {
+          status: 502,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        },
+      );
+    }
+    if (isOpenAI && !OPENAI_API_KEY) {
+      return new Response(
+        JSON.stringify({ error: 'OpenAI API key not configured' }),
+        {
+          status: 502,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        },
+      );
+    }
+    if (isGemini && !GEMINI_API_KEY) {
+      return new Response(
+        JSON.stringify({ error: 'Gemini API key not configured' }),
+        {
+          status: 502,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        },
+      );
     }
 
-    const response = await fetch(OPENROUTER_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://adam-cad.com',
-        'X-Title': 'Adam CAD',
-      },
-      body: JSON.stringify(requestBody),
-    });
+    const isReasoningModel = /^(o1|o3|o4)/i.test(getOpenAIModel(model));
+    let response: Response;
+    if (isAnthropic) {
+      const anthropicMessages = convertToAnthropicMessages(messagesToSend);
+      response = await fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: getAnthropicModel(model),
+          system: PARAMETRIC_AGENT_PROMPT,
+          messages: anthropicMessages,
+          tools: anthropicTools,
+          max_tokens: 16000,
+          stream: true,
+        }),
+      });
+    } else if (isOpenAI) {
+      const openaiModel = getOpenAIModel(model);
+      const requestBody: Record<string, unknown> = {
+        model: openaiModel,
+        messages: [
+          {
+            role: isReasoningModel ? 'developer' : 'system',
+            content: PARAMETRIC_AGENT_PROMPT,
+          },
+          ...messagesToSend,
+        ],
+        tools,
+        stream: true,
+      };
+      if (isReasoningModel) {
+        requestBody.max_completion_tokens = 16000;
+      } else {
+        requestBody.max_tokens = 16000;
+      }
+      response = await fetch(OPENAI_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+    } else {
+      // Gemini: build contents and call streamGenerateContent
+      const geminiContents = convertToGeminiContents(
+        PARAMETRIC_AGENT_PROMPT,
+        messagesToSend,
+      );
+      const geminiModel = getGeminiModel(model);
+      const geminiBody = {
+        contents: geminiContents,
+        systemInstruction: { parts: [{ text: PARAMETRIC_AGENT_PROMPT }] },
+        generationConfig: {
+          maxOutputTokens: 16000,
+          temperature: 0.7,
+        },
+        tools: {
+          functionDeclarations: [
+            {
+              name: 'build_parametric_model',
+              description:
+                'Generate or update an OpenSCAD model from user intent and context. Include parameters and ensure the model is manifold and 3D-printable.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  text: {
+                    type: 'string',
+                    description: 'User request for the model',
+                  },
+                  imageIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Image IDs',
+                  },
+                  baseCode: {
+                    type: 'string',
+                    description: 'Existing code to modify',
+                  },
+                  error: { type: 'string', description: 'Error to fix' },
+                },
+              },
+            },
+            {
+              name: 'apply_parameter_changes',
+              description:
+                'Apply simple parameter updates to the current artifact without re-generating the whole model.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  updates: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        name: { type: 'string' },
+                        value: { type: 'string' },
+                      },
+                      required: ['name', 'value'],
+                    },
+                  },
+                },
+                required: ['updates'],
+              },
+            },
+          ],
+        },
+      };
+      response = await fetch(
+        `${GEMINI_API_BASE}/models/${geminiModel}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiBody),
+        },
+      );
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`OpenRouter API Error: ${response.status} - ${errorText}`);
+      console.error(`Chat API Error: ${response.status} - ${errorText}`);
       throw new Error(
-        `OpenRouter API error: ${response.statusText} (${response.status})`,
+        `Chat API error: ${response.statusText} (${response.status})`,
       );
     }
 
@@ -618,6 +952,8 @@ Deno.serve(async (req) => {
           }
         };
 
+        const isAnthropicStream = useAnthropic(model);
+        const isGeminiStream = useGemini(model);
         try {
           const reader = response.body?.getReader();
           const decoder = new TextDecoder();
@@ -636,8 +972,108 @@ Deno.serve(async (req) => {
             buffer = lines.pop() || '';
 
             for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+
+              if (isAnthropicStream) {
+                if (!trimmed.startsWith('data: ')) continue;
+                const anthropicData = trimmed.slice(6);
+                if (anthropicData === '[DONE]') continue;
+                try {
+                  const chunk = JSON.parse(anthropicData);
+                  if (chunk.type === 'content_block_start') {
+                    const block = chunk.content_block;
+                    if (block.type === 'tool_use') {
+                      currentToolCall = {
+                        id: block.id,
+                        name: block.name,
+                        arguments: '',
+                      };
+                      content = {
+                        ...content,
+                        toolCalls: [
+                          ...(content.toolCalls || []),
+                          {
+                            name: block.name,
+                            id: block.id,
+                            status: 'pending' as const,
+                          },
+                        ],
+                      };
+                      streamMessage(controller, { ...newMessageData, content });
+                    }
+                  } else if (chunk.type === 'content_block_delta') {
+                    const delta = chunk.delta;
+                    if (delta.type === 'text_delta') {
+                      content = {
+                        ...content,
+                        text: (content.text || '') + delta.text,
+                      };
+                      streamMessage(controller, { ...newMessageData, content });
+                    } else if (
+                      delta.type === 'input_json_delta' &&
+                      currentToolCall
+                    ) {
+                      currentToolCall.arguments += delta.partial_json;
+                    }
+                  } else if (chunk.type === 'content_block_stop') {
+                    if (currentToolCall) {
+                      await handleToolCall(currentToolCall);
+                      currentToolCall = null;
+                    }
+                  }
+                } catch (e) {
+                  console.error('Error parsing Anthropic SSE chunk:', e);
+                }
+                continue;
+              }
+
+              if (isGeminiStream) {
+                if (!trimmed.startsWith('data: ')) continue;
+                const geminiData = trimmed.slice(6);
+                if (geminiData === '[DONE]') continue;
+                try {
+                  const chunk = JSON.parse(geminiData);
+                  const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+                  for (const part of parts) {
+                    if (part.text) {
+                      content = {
+                        ...content,
+                        text: (content.text || '') + part.text,
+                      };
+                      streamMessage(controller, { ...newMessageData, content });
+                    }
+                    if (part.functionCall) {
+                      const name = part.functionCall.name || '';
+                      const args =
+                        part.functionCall.args &&
+                        typeof part.functionCall.args === 'object'
+                          ? JSON.stringify(part.functionCall.args)
+                          : typeof part.functionCall.args === 'string'
+                            ? part.functionCall.args
+                            : '{}';
+                      const id = `gemini-${crypto.randomUUID()}`;
+                      currentToolCall = { id, name, arguments: args };
+                      content = {
+                        ...content,
+                        toolCalls: [
+                          ...(content.toolCalls || []),
+                          { name, id, status: 'pending' as const },
+                        ],
+                      };
+                      streamMessage(controller, { ...newMessageData, content });
+                      await handleToolCall(currentToolCall);
+                      currentToolCall = null;
+                    }
+                  }
+                } catch (e) {
+                  console.error('Error parsing Gemini SSE chunk:', e);
+                }
+                continue;
+              }
+
+              if (trimmed.startsWith('data: ')) {
+                const data = trimmed.slice(6);
                 if (data === '[DONE]') continue;
 
                 try {
@@ -646,7 +1082,6 @@ Deno.serve(async (req) => {
 
                   if (!delta) continue;
 
-                  // Handle text content
                   if (delta.content) {
                     content = {
                       ...content,
@@ -655,19 +1090,8 @@ Deno.serve(async (req) => {
                     streamMessage(controller, { ...newMessageData, content });
                   }
 
-                  // Handle reasoning content (if returned by OpenRouter)
-                  if (delta.reasoning) {
-                    // We can optionally display this, but for now we just consume it so it doesn't break anything
-                    // Or append to text if we want to show it?
-                    // Usually we don't show internal reasoning in the final message unless explicitly requested.
-                  }
-
-                  // Handle tool calls
                   if (delta.tool_calls) {
                     for (const toolCall of delta.tool_calls) {
-                      const _index = toolCall.index || 0;
-
-                      // Start of new tool call
                       if (toolCall.id) {
                         currentToolCall = {
                           id: toolCall.id,
@@ -690,8 +1114,6 @@ Deno.serve(async (req) => {
                           content,
                         });
                       }
-
-                      // Accumulate arguments
                       if (toolCall.function?.arguments && currentToolCall) {
                         currentToolCall.arguments +=
                           toolCall.function.arguments;
@@ -699,7 +1121,6 @@ Deno.serve(async (req) => {
                     }
                   }
 
-                  // Check if tool call is complete (when we get finish_reason)
                   if (
                     chunk.choices?.[0]?.finish_reason === 'tool_calls' &&
                     currentToolCall
@@ -739,7 +1160,14 @@ Deno.serve(async (req) => {
               );
 
               // Generate a title from the messages
-              const title = await generateTitleFromMessages(messagesToSend);
+              const title = await generateTitleFromMessages(
+                messagesToSend,
+                useAnthropic(model)
+                  ? 'anthropic'
+                  : useOpenAI(model)
+                    ? 'openai'
+                    : 'gemini',
+              );
 
               // Remove the code from the text (keep any non-code explanation)
               let cleanedText = content.text;
@@ -823,52 +1251,133 @@ Deno.serve(async (req) => {
               ...finalUserMessage,
             ];
 
-            // Code generation request logic
-            const codeRequestBody: OpenRouterRequest = {
-              model,
-              messages: [
-                { role: 'system', content: STRICT_CODE_PROMPT },
-                ...codeMessages,
-              ],
-              max_tokens: 16000,
-            };
+            // Code generation: use same provider (Anthropic, OpenAI, or Gemini) as main chat
+            const codeGenAnthropic = useAnthropic(model);
+            const codeGenOpenAI = useOpenAI(model);
+            const codeGenGemini = useGemini(model);
+            const titlePromise = generateTitleFromMessages(
+              messagesToSend,
+              codeGenAnthropic
+                ? 'anthropic'
+                : codeGenOpenAI
+                  ? 'openai'
+                  : 'gemini',
+            );
 
-            // Also apply thinking to code generation if enabled
-            if (thinking) {
-              codeRequestBody.reasoning = {
-                max_tokens: 12000,
-              };
-              codeRequestBody.max_tokens = 20000;
-            }
-
-            const [codeResult, titleResult] = await Promise.allSettled([
-              fetch(OPENROUTER_API_URL, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-                  'HTTP-Referer': 'https://adam-cad.com',
-                  'X-Title': 'Adam CAD',
-                },
-                body: JSON.stringify(codeRequestBody),
-              }).then(async (r) => {
+            let codeGenResult: Record<string, unknown> | null = null;
+            let codeGenError: string | null = null;
+            try {
+              if (codeGenAnthropic && ANTHROPIC_API_KEY) {
+                const anthropicMessages =
+                  convertToAnthropicMessages(codeMessages);
+                const r = await fetch(ANTHROPIC_API_URL, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': ANTHROPIC_API_KEY,
+                    'anthropic-version': '2023-06-01',
+                  },
+                  body: JSON.stringify({
+                    model: getAnthropicModel(model),
+                    system: STRICT_CODE_PROMPT,
+                    messages: anthropicMessages,
+                    max_tokens: 16000,
+                  }),
+                });
                 if (!r.ok) {
                   const t = await r.text();
                   throw new Error(`Code gen error: ${r.status} - ${t}`);
                 }
-                return r.json();
-              }),
-              generateTitleFromMessages(messagesToSend),
-            ]);
+                codeGenResult = await r.json();
+              } else if (codeGenOpenAI && OPENAI_API_KEY) {
+                const codeBody: Record<string, unknown> = {
+                  model: getOpenAIModel(model),
+                  messages: [
+                    {
+                      role: isReasoningModel ? 'developer' : 'system',
+                      content: STRICT_CODE_PROMPT,
+                    },
+                    ...codeMessages,
+                  ],
+                };
+                if (isReasoningModel) {
+                  codeBody.max_completion_tokens = 16000;
+                } else {
+                  codeBody.max_tokens = 16000;
+                }
+                const r = await fetch(OPENAI_API_URL, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${OPENAI_API_KEY}`,
+                  },
+                  body: JSON.stringify(codeBody),
+                });
+                if (!r.ok) {
+                  const t = await r.text();
+                  throw new Error(`Code gen error: ${r.status} - ${t}`);
+                }
+                codeGenResult = await r.json();
+              } else if (codeGenGemini && GEMINI_API_KEY) {
+                const geminiContents = convertToGeminiContents(
+                  '',
+                  codeMessages,
+                );
+                const r = await fetch(
+                  `${GEMINI_API_BASE}/models/${getGeminiModel(model)}:generateContent?key=${GEMINI_API_KEY}`,
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      contents: geminiContents,
+                      systemInstruction: {
+                        parts: [{ text: STRICT_CODE_PROMPT }],
+                      },
+                      generationConfig: { maxOutputTokens: 16000 },
+                    }),
+                  },
+                );
+                if (!r.ok) {
+                  const t = await r.text();
+                  throw new Error(`Code gen error: ${r.status} - ${t}`);
+                }
+                codeGenResult = await r.json();
+              } else {
+                throw new Error('No API key for code gen');
+              }
+            } catch (e) {
+              codeGenError = e instanceof Error ? e.message : String(e);
+              console.error('Code generation failed:', codeGenError);
+            }
+
+            const title = await titlePromise.catch(() => 'CAD Object');
 
             let code = '';
-            if (
-              codeResult.status === 'fulfilled' &&
-              codeResult.value.choices?.[0]?.message?.content
-            ) {
-              code = codeResult.value.choices[0].message.content.trim();
-            } else if (codeResult.status === 'rejected') {
-              console.error('Code generation failed:', codeResult.reason);
+            if (codeGenResult) {
+              // Extract from Anthropic shape
+              const anthropicContent = codeGenResult.content as
+                | Array<{ type: string; text?: string }>
+                | undefined;
+              if (
+                anthropicContent?.[0]?.type === 'text' &&
+                anthropicContent?.[0]?.text
+              ) {
+                code = String(anthropicContent[0].text).trim();
+              }
+              // Extract from OpenAI shape
+              const choices = codeGenResult.choices as
+                | Array<{ message?: { content?: string } }>
+                | undefined;
+              if (!code && choices?.[0]?.message?.content) {
+                code = String(choices[0].message.content).trim();
+              }
+              // Extract from Gemini shape
+              const candidates = codeGenResult.candidates as
+                | Array<{ content?: { parts?: Array<{ text?: string }> } }>
+                | undefined;
+              if (!code && candidates?.[0]?.content?.parts?.[0]?.text) {
+                code = String(candidates[0].content.parts[0].text).trim();
+              }
             }
 
             const codeBlockRegex = /^```(?:openscad)?\n?([\s\S]*?)\n?```$/;
@@ -877,19 +1386,16 @@ Deno.serve(async (req) => {
               code = match[1].trim();
             }
 
-            let title =
-              titleResult.status === 'fulfilled'
-                ? titleResult.value
-                : 'Adam Object';
-            const lower = title.toLowerCase();
+            let objectTitle = title;
+            const lower = objectTitle.toLowerCase();
             if (lower.includes('sorry') || lower.includes('apologize'))
-              title = 'Adam Object';
+              objectTitle = 'CAD Object';
 
             if (!code) {
               content = markToolAsError(content, toolCall.id);
             } else {
               const artifact: ParametricArtifact = {
-                title,
+                title: objectTitle,
                 version: 'v1',
                 code,
                 parameters: parseParameters(code),
@@ -968,7 +1474,7 @@ Deno.serve(async (req) => {
             }
 
             const artifact: ParametricArtifact = {
-              title: content.artifact?.title || 'Adam Object',
+              title: content.artifact?.title || 'CAD Object',
               version: content.artifact?.version || 'v1',
               code: patchedCode,
               parameters: parseParameters(patchedCode),

@@ -4,7 +4,6 @@
 
 // Setup type definitions for built-in Supabase Runtime APIs
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
-import { Anthropic } from 'npm:@anthropic-ai/sdk';
 import { corsHeaders } from '../_shared/cors.ts';
 import 'jsr:@std/dotenv/load';
 import { getAnonSupabaseClient } from '../_shared/supabaseClient.ts';
@@ -39,44 +38,42 @@ Deno.serve(async (req) => {
     });
   }
 
+  const isLocal = Deno.env.get('ENVIRONMENT') === 'local';
   const supabaseClient = getAnonSupabaseClient({
     global: {
       headers: { Authorization: req.headers.get('Authorization') ?? '' },
     },
   });
 
-  const { data: userData, error: userError } =
-    await supabaseClient.auth.getUser();
+  if (!isLocal) {
+    const { data: userData, error: userError } =
+      await supabaseClient.auth.getUser();
 
-  if (!userData.user) {
-    return new Response(
-      JSON.stringify({ error: { message: 'Unauthorized' } }),
-      {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      },
-    );
-  }
+    if (!userData.user) {
+      return new Response(
+        JSON.stringify({ error: { message: 'Unauthorized' } }),
+        {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        },
+      );
+    }
 
-  if (userError) {
-    return new Response(
-      JSON.stringify({ error: { message: userError.message } }),
-      {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      },
-    );
+    if (userError) {
+      return new Response(
+        JSON.stringify({ error: { message: userError.message } }),
+        {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        },
+      );
+    }
   }
 
   // Parse request body to get existing text if provided
   const { existingText }: { existingText?: string } = await req
     .json()
     .catch(() => ({}));
-
-  // Initialize Anthropic client for AI interactions
-  const anthropic = new Anthropic({
-    apiKey: Deno.env.get('ANTHROPIC_API_KEY') ?? '',
-  });
 
   try {
     let systemPrompt: string;
@@ -102,34 +99,42 @@ Deno.serve(async (req) => {
       maxTokens = 100;
     }
 
-    // Configure Claude API call
-    const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
-      max_tokens: maxTokens,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: userPrompt,
-        },
-      ],
+    const anthropicApiKey = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
+    if (!anthropicApiKey) {
+      throw new Error('Missing ANTHROPIC_API_KEY for prompt-generator');
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': anthropicApiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        system: systemPrompt,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: userPrompt }],
+      }),
     });
 
-    // Extract prompt from response
-    let prompt = '';
-    if (Array.isArray(response.content) && response.content.length > 0) {
-      const lastContent = response.content[response.content.length - 1];
-      if (lastContent.type === 'text') {
-        prompt = lastContent.text.trim();
-      }
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Anthropic prompt-generator error: ${response.status} - ${errorText}`,
+      );
     }
+
+    const data = await response.json();
+    const prompt = data.content?.[0]?.text?.trim?.() ?? '';
 
     return new Response(JSON.stringify({ prompt }), {
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    console.error('Error calling Claude:', error);
+    console.error('Error calling Anthropic (prompt-generator):', error);
 
     return new Response(
       JSON.stringify({

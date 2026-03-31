@@ -161,7 +161,7 @@ function FixWithAIButton({
             Error Compiling Model
           </p>
           <p className="mt-1 text-xs text-adam-text-primary/60">
-            Adam encountered an error while compiling
+            Encountered an error while compiling
           </p>
         </div>
       </div>

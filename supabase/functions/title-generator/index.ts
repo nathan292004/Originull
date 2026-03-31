@@ -1,15 +1,14 @@
-// Follow this setup guide to integrate the Deno language server with your editor:
-// https://deno.land/manual/getting_started/setup_your_environment
-// This enables autocomplete, go to definition, etc.
-
 // Setup type definitions for built-in Supabase Runtime APIs
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
-import { Anthropic } from 'npm:@anthropic-ai/sdk';
 import { corsHeaders } from '../_shared/cors.ts';
 import 'jsr:@std/dotenv/load';
 import { getAnonSupabaseClient } from '../_shared/supabaseClient.ts';
 import { Content } from '@shared/types.ts';
 import { formatCreativeUserMessage } from '../_shared/messageUtils.ts';
+
+const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
+const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
+const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
 
 const TITLE_SYSTEM_PROMPT = `You are a helpful assistant that generates concise, descriptive titles for conversation threads based on the first message in the thread.
 The messages can be text, images, or screenshots of 3d models.
@@ -58,68 +57,137 @@ Deno.serve(async (req) => {
     conversationId,
   }: { content: Content; conversationId: string } = await req.json();
 
+  const isLocal = Deno.env.get('ENVIRONMENT') === 'local';
   const supabaseClient = getAnonSupabaseClient({
     global: {
       headers: { Authorization: req.headers.get('Authorization') ?? '' },
     },
   });
 
-  const { data: userData, error: userError } =
-    await supabaseClient.auth.getUser();
+  if (!isLocal) {
+    const { data: userData, error: userError } =
+      await supabaseClient.auth.getUser();
 
-  if (!userData.user) {
-    return new Response(
-      JSON.stringify({ error: { message: 'Unauthorized' } }),
-      {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      },
-    );
+    if (!userData.user) {
+      return new Response(
+        JSON.stringify({ error: { message: 'Unauthorized' } }),
+        {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        },
+      );
+    }
+
+    if (userError) {
+      return new Response(
+        JSON.stringify({ error: { message: userError.message } }),
+        {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        },
+      );
+    }
   }
 
-  if (userError) {
-    return new Response(
-      JSON.stringify({ error: { message: userError.message } }),
-      {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      },
-    );
-  }
-
+  const userId = isLocal
+    ? 'local-dev-user'
+    : ((await supabaseClient.auth.getUser()).data.user?.id ?? '');
   const userMessage = await formatCreativeUserMessage(
     { id: '1', role: 'user', content: content },
     supabaseClient,
-    userData.user.id,
+    userId,
     conversationId,
   );
 
-  // Initialize Anthropic client for AI interactions
-  const anthropic = new Anthropic({
-    apiKey: Deno.env.get('ANTHROPIC_API_KEY') ?? '',
-  });
-
   try {
-    // Configure Claude API call
-    const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
-      max_tokens: 100,
-      system: TITLE_SYSTEM_PROMPT,
-      messages: [userMessage],
-    });
-
-    // Extract title from response
     let title = 'New Conversation';
-    if (Array.isArray(response.content) && response.content.length > 0) {
-      const lastContent = response.content[response.content.length - 1];
-      if (lastContent.type === 'text') {
-        title = lastContent.text.trim();
 
-        // Ensure title is not too long for the database
-        if (title.length > 255) {
-          title = title.substring(0, 252) + '...';
-        }
+    const userText =
+      typeof userMessage.content === 'string'
+        ? userMessage.content
+        : Array.isArray(userMessage.content)
+          ? userMessage.content
+              .filter((b: Record<string, unknown>) => b.type === 'text')
+              .map((b: Record<string, unknown>) => b.text)
+              .join(' ')
+          : '';
+
+    if (ANTHROPIC_API_KEY) {
+      // Use Anthropic Claude
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-opus-4-6',
+          system: TITLE_SYSTEM_PROMPT,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: userText || 'Generate a title' }],
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        title = data.content?.[0]?.text?.trim() || title;
       }
+    } else if (OPENAI_API_KEY) {
+      // Use OpenAI
+      const response = await fetch(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            max_tokens: 100,
+            messages: [
+              { role: 'system', content: TITLE_SYSTEM_PROMPT },
+              { role: 'user', content: userText || 'Generate a title' },
+            ],
+          }),
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        title = data.choices?.[0]?.message?.content?.trim() || title;
+      }
+    } else if (GEMINI_API_KEY) {
+      // Use Gemini
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: userText || 'Generate a title' }],
+              },
+            ],
+            systemInstruction: { parts: [{ text: TITLE_SYSTEM_PROMPT }] },
+            generationConfig: { maxOutputTokens: 100 },
+          }),
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        title =
+          data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || title;
+      }
+    }
+
+    // Ensure title is not too long for the database
+    if (title.length > 255) {
+      title = title.substring(0, 252) + '...';
     }
 
     if (
@@ -134,18 +202,15 @@ Deno.serve(async (req) => {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    console.error('Error calling Claude:', error);
-
-    // Fallback to basic title generation
-    const fallbackTitle = 'New Conversation';
+    console.error('Error generating title:', error);
 
     return new Response(
       JSON.stringify({
-        title: fallbackTitle,
+        title: 'New Conversation',
         error: error instanceof Error ? error.message : 'Unknown error',
       }),
       {
-        status: 200, // Still return 200 with a fallback title
+        status: 200,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       },
     );

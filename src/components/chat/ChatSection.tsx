@@ -28,7 +28,9 @@ export function ChatSection({ messages }: ChatSectionProps) {
   // Sync model selection with the conversation history (last used model)
   useEffect(() => {
     if (messages.length > 0) {
-      const lastAssistantMessage = [...messages].reverse().find((m) => m.role === 'assistant');
+      const lastAssistantMessage = [...messages]
+        .reverse()
+        .find((m) => m.role === 'assistant');
       if (lastAssistantMessage?.content?.model) {
         setModel(lastAssistantMessage.content.model);
       }
@@ -113,7 +115,7 @@ export function ChatSection({ messages }: ChatSectionProps) {
       <div className="w-full min-w-52 max-w-xl bg-transparent px-4 pb-6">
         <TextAreaChat
           onSubmit={sendMessage}
-          placeholder="Keep iterating with Adam..."
+          placeholder="Keep iterating..."
           disabled={isLoading}
           model={model}
           setModel={setModel}
